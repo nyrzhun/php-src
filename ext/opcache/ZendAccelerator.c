@@ -4337,9 +4337,14 @@ static void preload_load(void)
 		size_t old_map_ptr_last = CG(map_ptr_last);
 		CG(map_ptr_last) = ZCSG(map_ptr_last);
 		CG(map_ptr_size) = ZEND_MM_ALIGNED_SIZE_EX(CG(map_ptr_last) + 1, 4096);
-		CG(map_ptr_real_base) = perealloc(CG(map_ptr_real_base), CG(map_ptr_size) * sizeof(void*), 1);
+		/* The real base also carries the static map_ptr region (internal-function
+		 * run-time caches) in front of the dynamic region; size and offsets must
+		 * account for it. Static entries cannot be created during preloading
+		 * (module registration is over and dl() is unavailable), so unlike the
+		 * dynamic counter, zend_map_ptr_static_last needs no sync from SHM. */
+		CG(map_ptr_real_base) = perealloc(CG(map_ptr_real_base), (zend_map_ptr_static_size + CG(map_ptr_size)) * sizeof(void*), 1);
 		CG(map_ptr_base) = ZEND_MAP_PTR_BIASED_BASE(CG(map_ptr_real_base));
-		memset((void **) CG(map_ptr_real_base) + old_map_ptr_last, 0,
+		memset((void **) CG(map_ptr_real_base) + zend_map_ptr_static_size + old_map_ptr_last, 0,
 			(CG(map_ptr_last) - old_map_ptr_last) * sizeof(void *));
 	}
 }

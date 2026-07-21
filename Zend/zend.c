@@ -729,13 +729,13 @@ static void compiler_globals_ctor(zend_compiler_globals *compiler_globals) /* {{
 	compiler_globals->map_ptr_base = ZEND_MAP_PTR_BIASED_BASE(NULL);
 	compiler_globals->map_ptr_size = 0;
 	compiler_globals->map_ptr_last = global_map_ptr_last;
-	if (compiler_globals->map_ptr_last) {
+	if (compiler_globals->map_ptr_last || zend_map_ptr_static_size) {
 		/* Allocate map_ptr table */
 		compiler_globals->map_ptr_size = ZEND_MM_ALIGNED_SIZE_EX(compiler_globals->map_ptr_last, 4096);
-		void *base = pemalloc(compiler_globals->map_ptr_size * sizeof(void*), 1);
+		void *base = pemalloc((zend_map_ptr_static_size + compiler_globals->map_ptr_size) * sizeof(void*), 1);
 		compiler_globals->map_ptr_real_base = base;
 		compiler_globals->map_ptr_base = ZEND_MAP_PTR_BIASED_BASE(base);
-		memset(base, 0, compiler_globals->map_ptr_last * sizeof(void*));
+		memset(base, 0, (zend_map_ptr_static_size + compiler_globals->map_ptr_last) * sizeof(void*));
 	}
 }
 /* }}} */
@@ -1137,6 +1137,8 @@ void zend_shutdown(void) /* {{{ */
 		CG(map_ptr_base) = ZEND_MAP_PTR_BIASED_BASE(NULL);
 		CG(map_ptr_size) = 0;
 	}
+	zend_map_ptr_static_last = 0;
+	zend_map_ptr_static_size = 0;
 	if (CG(script_encoding_list)) {
 		free(ZEND_VOIDP(CG(script_encoding_list)));
 		CG(script_encoding_list) = NULL;
@@ -1241,8 +1243,10 @@ ZEND_API void zend_activate(void) /* {{{ */
 	init_compiler();
 	init_executor();
 	startup_scanner();
-	if (CG(map_ptr_last)) {
-		memset(CG(map_ptr_real_base), 0, CG(map_ptr_last) * sizeof(void*));
+	if (zend_map_ptr_static_size || CG(map_ptr_last)) {
+		/* Zero both the static region (internal-function run-time caches, refilled
+		 * below) and the dynamic region (CE caches / op_array run-time caches). */
+		memset(CG(map_ptr_real_base), 0, (zend_map_ptr_static_size + CG(map_ptr_last)) * sizeof(void*));
 	}
 	zend_init_internal_run_time_cache();
 	zend_observer_activate();
@@ -1894,6 +1898,9 @@ void free_estring(char **str_p) /* {{{ */
 }
 /* }}} */
 
+ZEND_API size_t zend_map_ptr_static_size;
+ZEND_API size_t zend_map_ptr_static_last;
+
 ZEND_API void zend_map_ptr_reset(void)
 {
 	CG(map_ptr_last) = global_map_ptr_last;
@@ -1906,12 +1913,34 @@ ZEND_API void *zend_map_ptr_new(void)
 	if (CG(map_ptr_last) >= CG(map_ptr_size)) {
 		/* Grow map_ptr table */
 		CG(map_ptr_size) = ZEND_MM_ALIGNED_SIZE_EX(CG(map_ptr_last) + 1, 4096);
-		CG(map_ptr_real_base) = perealloc(CG(map_ptr_real_base), CG(map_ptr_size) * sizeof(void*), 1);
+		CG(map_ptr_real_base) = perealloc(CG(map_ptr_real_base), (zend_map_ptr_static_size + CG(map_ptr_size)) * sizeof(void*), 1);
 		CG(map_ptr_base) = ZEND_MAP_PTR_BIASED_BASE(CG(map_ptr_real_base));
 	}
-	ptr = (void**)CG(map_ptr_real_base) + CG(map_ptr_last);
+	ptr = (void**)CG(map_ptr_real_base) + zend_map_ptr_static_size + CG(map_ptr_last);
 	*ptr = NULL;
 	CG(map_ptr_last)++;
+	return ZEND_MAP_PTR_PTR2OFFSET(ptr);
+}
+
+ZEND_API void *zend_map_ptr_new_static(void)
+{
+	void **ptr;
+
+	if (zend_map_ptr_static_last >= zend_map_ptr_static_size) {
+		zend_map_ptr_static_size += 4096;
+		/* Grow map_ptr table; the new chunk is prepended so existing offsets
+		 * stay valid (the +4096 shift is cancelled by the biased-base change). */
+		void *new_base = pemalloc((zend_map_ptr_static_size + CG(map_ptr_size)) * sizeof(void*), 1);
+		if (CG(map_ptr_real_base)) {
+			memcpy((void **)new_base + 4096, CG(map_ptr_real_base), (CG(map_ptr_last) + zend_map_ptr_static_size - 4096) * sizeof(void *));
+			pefree(CG(map_ptr_real_base), 1);
+		}
+		CG(map_ptr_real_base) = new_base;
+		CG(map_ptr_base) = ZEND_MAP_PTR_BIASED_BASE(new_base);
+	}
+	ptr = (void**)CG(map_ptr_real_base) + (zend_map_ptr_static_last & 4095);
+	*ptr = NULL;
+	zend_map_ptr_static_last++;
 	return ZEND_MAP_PTR_PTR2OFFSET(ptr);
 }
 
@@ -1923,10 +1952,10 @@ ZEND_API void zend_map_ptr_extend(size_t last)
 		if (last >= CG(map_ptr_size)) {
 			/* Grow map_ptr table */
 			CG(map_ptr_size) = ZEND_MM_ALIGNED_SIZE_EX(last, 4096);
-			CG(map_ptr_real_base) = perealloc(CG(map_ptr_real_base), CG(map_ptr_size) * sizeof(void*), 1);
+			CG(map_ptr_real_base) = perealloc(CG(map_ptr_real_base), (zend_map_ptr_static_size + CG(map_ptr_size)) * sizeof(void*), 1);
 			CG(map_ptr_base) = ZEND_MAP_PTR_BIASED_BASE(CG(map_ptr_real_base));
 		}
-		ptr = (void**)CG(map_ptr_real_base) + CG(map_ptr_last);
+		ptr = (void**)CG(map_ptr_real_base) + zend_map_ptr_static_size + CG(map_ptr_last);
 		memset(ptr, 0, (last - CG(map_ptr_last)) * sizeof(void*));
 		CG(map_ptr_last) = last;
 	}
